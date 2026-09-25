@@ -5,8 +5,11 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from .cases import load_case_set
+import httpx2
+
+from .cases import CaseSet, load_case_set
 from .config import Settings
 from .contracts import Contracts
 from .mcp_gateway import connect_gateway
@@ -17,6 +20,29 @@ from .workflow import solve_case
 
 def _root(value: str) -> Path:
     return Path(value).resolve()
+
+
+async def _prepare_run(settings: Settings, case_set: CaseSet) -> str:
+    """Open the team-scoped run required before the MCP gateway can serve case evidence."""
+    async with httpx2.AsyncClient(timeout=30.0) as client:
+        response = await client.post(
+            f"{settings.competition_api_url}/api/v2/runs",
+            headers={"Authorization": f"Bearer {settings.team_api_key}"},
+            json={"variant_id": case_set.variant_id},
+        )
+    if response.status_code not in (200, 201):
+        raise RuntimeError(
+            f"could not prepare {case_set.variant_id} run: HTTP {response.status_code}"
+        )
+    run = response.json()
+    if not isinstance(run, dict) or run.get("variant_id") != case_set.variant_id:
+        raise ValueError("competition API returned an invalid run")
+    if run.get("case_set_version") != case_set.version:
+        raise ValueError("active run case-set version does not match local inputs")
+    endpoint = run.get("mcp_endpoint")
+    if not isinstance(endpoint, str) or not endpoint.startswith(("http://", "https://")):
+        raise ValueError("competition API returned an invalid MCP endpoint")
+    return endpoint
 
 
 async def _show_tools(root: Path) -> None:
@@ -31,33 +57,46 @@ async def _run(root: Path) -> None:
     settings = Settings.load(root)
     case_set = load_case_set(root)
     contracts = Contracts(root / "contracts" / "schemas")
-    output_root = root / "outputs"
-    trace_path = root / "traces" / "trace.jsonl"
-    output_root.mkdir(parents=True, exist_ok=True)
-    trace_path.parent.mkdir(parents=True, exist_ok=True)
-    for stale in output_root.glob("*.json"):
-        stale.unlink()
-    trace_path.unlink(missing_ok=True)
-    trace = TraceWriter(trace_path, contracts)
+    mcp_endpoint = await _prepare_run(settings, case_set)
+    with TemporaryDirectory(prefix=".day09-run-", dir=root) as staged_name:
+        staged_root = Path(staged_name)
+        output_root = staged_root / "outputs"
+        trace_path = staged_root / "traces" / "trace.jsonl"
+        output_root.mkdir(parents=True)
+        trace = TraceWriter(trace_path, contracts)
 
-    async with connect_gateway(settings.mcp_endpoint, settings.team_api_key, contracts) as gateway:
-        discovered_tools = await gateway.list_tools()
-        if not discovered_tools:
-            raise RuntimeError("MCP Gateway returned no tools")
+        async with connect_gateway(mcp_endpoint, settings.team_api_key, contracts) as gateway:
+            discovered_tools = await gateway.list_tools()
+            if not discovered_tools:
+                raise RuntimeError("MCP Gateway returned no tools")
+            for case_id in case_set.case_ids:
+                case = case_set.cases[case_id]
+                trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
+                output = await solve_case(case, gateway, trace)
+                contracts.validate_output(output, f"outputs/{case_id}.json")
+                if output.get("case_id") != case_id:
+                    raise ValueError(f"solver returned a mismatched case_id for {case_id}")
+                if "evidence_refs" in output and not output["evidence_refs"]:
+                    raise RuntimeError(
+                        f"{case_id}: no MCP evidence; previous outputs are preserved"
+                    )
+                target = output_root / f"{case_id}.json"
+                target.write_text(
+                    json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+                )
+                trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+
+        validate_artifacts(staged_root, case_set, contracts)
+        published_outputs = root / "outputs"
+        published_trace = root / "traces" / "trace.jsonl"
+        published_outputs.mkdir(parents=True, exist_ok=True)
+        published_trace.parent.mkdir(parents=True, exist_ok=True)
         for case_id in case_set.case_ids:
-            case = case_set.cases[case_id]
-            trace.emit(case_id=case_id, event_type="case_received", actor="coordinator")
-            output = await solve_case(case, gateway, trace)
-            contracts.validate_output(output, f"outputs/{case_id}.json")
-            if output.get("case_id") != case_id:
-                raise ValueError(f"solver returned a mismatched case_id for {case_id}")
-            target = output_root / f"{case_id}.json"
-            temporary = target.with_suffix(".json.tmp")
-            temporary.write_text(
-                json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
-            temporary.replace(target)
-            trace.emit(case_id=case_id, event_type="case_finalized", actor="coordinator")
+            (output_root / f"{case_id}.json").replace(published_outputs / f"{case_id}.json")
+        for stale in published_outputs.glob("*.json"):
+            if stale.stem not in case_set.case_ids:
+                stale.unlink()
+        trace_path.replace(published_trace)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -80,8 +119,7 @@ def main() -> None:
         if args.command == "validate-inputs":
             case_set = load_case_set(root)
             print(
-                f"OK: {case_set.variant_id} / {case_set.version} / "
-                f"{len(case_set.case_ids)} cases"
+                f"OK: {case_set.variant_id} / {case_set.version} / {len(case_set.case_ids)} cases"
             )
         elif args.command == "mcp-tools":
             asyncio.run(_show_tools(root))
@@ -95,6 +133,12 @@ def main() -> None:
         elif args.command == "package":
             destination = package_submission(root, root / args.output)
             print(f"OK: {destination}")
+    except ExceptionGroup as exc:
+        cause: BaseException = exc
+        while isinstance(cause, BaseExceptionGroup):
+            cause = cause.exceptions[0]
+        print(f"ERROR: {cause}", file=sys.stderr)
+        raise SystemExit(1) from exc
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc

@@ -151,6 +151,9 @@ day09 run
 day09 validate
 ```
 
+`day09 run` tạo phiên L3B qua Competition API trước khi gọi MCP, kiểm tra
+`case_set_version` và chỉ thay output cũ sau khi toàn bộ 100 case được validate.
+
 Kết quả được tạo tại:
 
 ```text
